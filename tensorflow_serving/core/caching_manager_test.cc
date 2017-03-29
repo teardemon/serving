@@ -30,6 +30,7 @@ limitations under the License.
 #include "tensorflow_serving/core/servable_state.h"
 #include "tensorflow_serving/core/servable_state_monitor.h"
 #include "tensorflow_serving/core/simple_loader.h"
+#include "tensorflow_serving/core/test_util/fake_loader_source_adapter.h"
 #include "tensorflow_serving/core/test_util/manager_test_util.h"
 #include "tensorflow_serving/util/event_bus.h"
 #include "tensorflow_serving/util/optional.h"
@@ -39,6 +40,7 @@ namespace tensorflow {
 namespace serving {
 namespace {
 
+using ::testing::HasSubstr;
 using ::testing::UnorderedElementsAre;
 using ::testing::UnorderedElementsAreArray;
 
@@ -51,9 +53,14 @@ class StringLoaderFactory : public CachingManager::LoaderFactory {
 
   ~StringLoaderFactory() override = default;
 
-  Status CreateLoader(const ServableId& id,
-                      std::unique_ptr<ServableData<std::unique_ptr<Loader>>>*
-                          loaded_data) override {
+  ServableData<std::unique_ptr<Loader>> CreateLoader(
+      const ServableId& id) override {
+    // Update state to indicate a new loader was created.
+    {
+      mutex_lock l(mu_);
+      num_loaders_dispensed_++;
+    }
+
     auto servable_creator = [&](std::unique_ptr<string>* servable) {
       servable->reset(new string);
       **servable = strings::StrCat(id.name, "-", id.version);
@@ -62,12 +69,7 @@ class StringLoaderFactory : public CachingManager::LoaderFactory {
     std::unique_ptr<Loader> loader;
     loader.reset(new SimpleLoader<string>(
         servable_creator, SimpleLoader<string>::EstimateNoResources()));
-    loaded_data->reset(
-        new ServableData<std::unique_ptr<Loader>>(id, std::move(loader)));
-    // Update state to indicate a new loader was created.
-    mutex_lock l(mu_);
-    num_loaders_dispensed_++;
-    return Status::OK();
+    return ServableData<std::unique_ptr<Loader>>(id, std::move(loader));
   }
 
   // Returns the latest version corresponding to the servable name.
@@ -109,18 +111,15 @@ class ErrorLoaderFactory : public CachingManager::LoaderFactory {
   ErrorLoaderFactory() = default;
   ~ErrorLoaderFactory() override = default;
 
-  Status CreateLoader(const ServableId& id,
-                      std::unique_ptr<ServableData<std::unique_ptr<Loader>>>*
-                          loaded_data) override {
+  ServableData<std::unique_ptr<Loader>> CreateLoader(
+      const ServableId& id) override {
     auto servable_creator = [&](std::unique_ptr<string>* servable) {
       return errors::Unknown("error loader-factory");
     };
     std::unique_ptr<Loader> loader;
     loader.reset(new SimpleLoader<string>(
         servable_creator, SimpleLoader<string>::EstimateNoResources()));
-    loaded_data->reset(
-        new ServableData<std::unique_ptr<Loader>>(id, std::move(loader)));
-    return Status::OK();
+    return ServableData<std::unique_ptr<Loader>>(id, std::move(loader));
   }
 
   int64 GetLatestVersion(const string& request_name) const override {
@@ -138,7 +137,13 @@ constexpr char kServableName2[] = "kServableName2";
 
 constexpr int kNumThreads = 10;
 
-class CachingManagerTest : public ::testing::TestWithParam<int> {
+// We parameterize this test with the number of load & unload threads. (Zero
+// means use an in-line executor instead of a thread pool.)
+struct ThreadPoolSizes {
+  uint64 num_load_threads;
+  uint64 num_unload_threads;
+};
+class CachingManagerTest : public ::testing::TestWithParam<ThreadPoolSizes> {
  protected:
   CachingManagerTest()
       : servable_event_bus_(EventBus<ServableState>::CreateEventBus()),
@@ -146,7 +151,8 @@ class CachingManagerTest : public ::testing::TestWithParam<int> {
     CachingManager::Options options;
     options.env = Env::Default();
     options.servable_event_bus = servable_event_bus_.get();
-    options.num_load_unload_threads = GetParam();
+    options.num_load_threads = GetParam().num_load_threads;
+    options.num_unload_threads = GetParam().num_unload_threads;
     options.max_num_load_retries = 1;
     options.load_retry_interval_micros = 0;
 
@@ -165,7 +171,8 @@ class CachingManagerTest : public ::testing::TestWithParam<int> {
     CachingManager::Options options;
     options.env = Env::Default();
     options.servable_event_bus = servable_event_bus_.get();
-    options.num_load_unload_threads = GetParam();
+    options.num_load_threads = GetParam().num_load_threads;
+    options.num_unload_threads = GetParam().num_unload_threads;
     options.max_num_load_retries = 1;
     options.load_retry_interval_micros = 0;
 
@@ -191,8 +198,11 @@ class CachingManagerTest : public ::testing::TestWithParam<int> {
   StringLoaderFactory* string_loader_factory_;
 };
 
-INSTANTIATE_TEST_CASE_P(WithOrWithoutThreadPool, CachingManagerTest,
-                        ::testing::Values(0 /* WithoutThreadPool */, 4));
+INSTANTIATE_TEST_CASE_P(
+    WithOrWithoutThreadPools, CachingManagerTest,
+    ::testing::Values(
+        ThreadPoolSizes{0, 0} /* without load or unload threadpools */,
+        ThreadPoolSizes{4, 4} /* with load and unload threadpools */));
 
 ///////////////////////////////////////////////////////////////////////////////
 // Servable handles.
@@ -511,6 +521,34 @@ TEST_P(CachingManagerTest, ConcurrentIntersectingRequests) {
 }
 
 ///////////////////////////////////////////////////////////////////////////////
+
+TEST(PathPrefixLoaderFactoryTest, Basic) {
+  auto adapter = std::unique_ptr<StoragePathSourceAdapter>(
+      new test_util::FakeLoaderSourceAdapter("suffix"));
+  PathPrefixLoaderFactory factory("prefix", std::move(adapter));
+
+  ServableData<std::unique_ptr<Loader>> loader_data =
+      factory.CreateLoader({"servable_name", 0});
+  TF_ASSERT_OK(loader_data.status());
+  std::unique_ptr<Loader> loader = loader_data.ConsumeDataOrDie();
+  TF_ASSERT_OK(loader->Load());
+  EXPECT_EQ("prefix/servable_name/suffix", *loader->servable().get<string>());
+
+  EXPECT_EQ(0, factory.GetLatestVersion("blah"));
+}
+
+TEST(PathPrefixLoaderFactoryTest, VersionOtherThanZeroYieldsError) {
+  auto adapter = std::unique_ptr<StoragePathSourceAdapter>(
+      new test_util::FakeLoaderSourceAdapter("suffix"));
+  PathPrefixLoaderFactory factory("prefix", std::move(adapter));
+
+  ServableData<std::unique_ptr<Loader>> loader_data =
+      factory.CreateLoader({"servable_name", 42});
+  ASSERT_FALSE(loader_data.status().ok());
+  EXPECT_THAT(loader_data.status().ToString(),
+              HasSubstr("PathPrefixLoaderFactory only supports single-version "
+                        "servables at version 0"));
+}
 
 }  // namespace
 }  // namespace serving

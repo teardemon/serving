@@ -20,6 +20,8 @@ The model is exported with proper signatures that can be loaded by standard
 tensorflow_model_server.
 """
 
+from __future__ import print_function
+
 import os.path
 
 # This is a placeholder for a Google-internal import.
@@ -154,8 +156,8 @@ def preprocess_image(image_buffer):
                                    align_corners=False)
   image = tf.squeeze(image, [0])
   # Finally, rescale to [-1,1] instead of [0, 1)
-  image = tf.sub(image, 0.5)
-  image = tf.mul(image, 2.0)
+  image = tf.subtract(image, 0.5)
+  image = tf.multiply(image, 2.0)
   return image
 
 

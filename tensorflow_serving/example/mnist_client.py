@@ -25,6 +25,8 @@ Typical usage example:
     mnist_client.py --num_tests=100 --server=localhost:9000
 """
 
+from __future__ import print_function
+
 import sys
 import threading
 
@@ -142,6 +144,7 @@ def do_inference(hostport, work_dir, concurrency, num_tests):
   for _ in range(num_tests):
     request = predict_pb2.PredictRequest()
     request.model_spec.name = 'mnist'
+    request.model_spec.signature_name = 'predict_images'
     image, label = test_data_set.next_batch(1)
     request.inputs['images'].CopyFrom(
         tf.contrib.util.make_tensor_proto(image[0], shape=[1, image[0].size]))
